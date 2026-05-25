@@ -17,14 +17,14 @@ class LockerResponse(LockerBase):
     assigned_user_id: Optional[int] = None
     occupied_until: Optional[datetime] = None
     last_payment_at: Optional[datetime] = None
-    pin_code: Optional[str] = None
+    pin_close: Optional[str] = None
+    pin_open: Optional[str] = None
     is_locked: bool = False
     payment_receipt_url: Optional[str] = None
     pending_rent_hours: Optional[float] = None
     approved_at: Optional[datetime] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 class LockerRent(BaseModel):
     hours: float

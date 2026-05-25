@@ -15,6 +15,7 @@ from app.models.locker import Locker
 from app.models.user import User
 from app.schemas.locker import LockerCreate, LockerResponse, LockerRent
 from app.core.security import get_current_active_user, get_current_admin, get_current_client, get_current_user_optional
+from app.core.email import send_pin_email, send_alert_email
 
 router = APIRouter(prefix="/lockers", tags=["lockers"])
 
@@ -44,7 +45,8 @@ def get_lockers(db: Session = Depends(get_db), current_user: Optional[User] = De
     for l in lockers:
         db.expunge(l)
         if not current_user or l.assigned_user_id != current_user.id:
-            l.pin_code = None
+            l.pin_close = None
+            l.pin_open = None
             l.payment_receipt_url = None
             
     return lockers
@@ -88,8 +90,9 @@ def rent_locker(locker_id: int, rent_in: LockerRent, db: Session = Depends(get_d
     locker.last_payment_at = datetime.now(timezone.utc)
     locker.occupied_until = datetime.now(timezone.utc) + timedelta(hours=rent_in.hours)
     
-    # Asignar un PIN aleatorio de 4 dígitos y poner cerrojo abierto inicialmente
-    locker.pin_code = f"{random.randint(1000, 9999)}"
+    # Asignar dos PINs aleatorios de 4 dígitos y poner cerrojo abierto inicialmente
+    locker.pin_close = f"{random.randint(1000, 9999)}"
+    locker.pin_open = f"{random.randint(1000, 9999)}"
     locker.is_locked = False
     
     db.commit()
@@ -116,7 +119,8 @@ def release_locker(locker_id: int, db: Session = Depends(get_db), current_user: 
     locker.assigned_user_id = None
     locker.occupied_until = None
     locker.last_payment_at = None
-    locker.pin_code = None
+    locker.pin_close = None
+    locker.pin_open = None
     locker.is_locked = False
     
     db.commit()
@@ -188,6 +192,12 @@ def close_locker_client(locker_id: int, db: Session = Depends(get_db), current_u
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, 
             detail="No tienes permisos para interactuar con este casillero"
+        )
+        
+    if locker.occupied_until and locker.occupied_until < datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="Tu tiempo de alquiler ha expirado. Por favor, retira tus pertenencias."
         )
         
     locker.is_locked = True
@@ -345,6 +355,7 @@ def rent_locker_public(
     locker_id: int,
     background_tasks: BackgroundTasks,
     hours: float = Form(...),
+    contact_email: Optional[str] = Form(None),
     discount_code: Optional[str] = Form(None),
     receipt: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
@@ -408,12 +419,14 @@ def rent_locker_public(
     # Renta del casillero
     if final_price > 0.0:
         locker.status = "ESPERANDO_VERIFICACION"
-        locker.pin_code = None
+        locker.pin_close = None
+        locker.pin_open = None
         locker.occupied_until = None
     else:
         # Si es gratis, se aprueba automaticamente
         locker.status = "OCUPADO"
-        locker.pin_code = f"{random.randint(1000, 9999)}"
+        locker.pin_close = f"{random.randint(1000, 9999)}"
+        locker.pin_open = f"{random.randint(1000, 9999)}"
         locker.occupied_until = None
         locker.approved_at = datetime.now(timezone.utc)
         background_tasks.add_task(auto_start_locker_timer, locker.id)
@@ -423,6 +436,8 @@ def rent_locker_public(
     locker.pending_rent_hours = hours
     locker.payment_receipt_url = f"/static/receipts/{unique_filename}" if unique_filename else None
     locker.is_locked = False
+    locker.contact_email = contact_email
+    locker.warning_sent = False
     
     db.commit()
     db.refresh(locker)
@@ -449,7 +464,7 @@ def approve_rental(locker_id: int, background_tasks: BackgroundTasks, db: Sessio
         raise HTTPException(status_code=400, detail="El casillero no está esperando verificación")
         
     # Si pin_code ya está asignado, se trata de una extensión de alquiler
-    if locker.pin_code is not None:
+    if locker.pin_close is not None:
         if locker.occupied_until and locker.occupied_until > datetime.now(timezone.utc):
             locker.occupied_until = locker.occupied_until + timedelta(hours=locker.pending_rent_hours)
         else:
@@ -460,7 +475,8 @@ def approve_rental(locker_id: int, background_tasks: BackgroundTasks, db: Sessio
     else:
         # Alquiler nuevo
         locker.status = "OCUPADO"
-        locker.pin_code = f"{random.randint(1000, 9999)}"
+        locker.pin_close = f"{random.randint(1000, 9999)}"
+        locker.pin_open = f"{random.randint(1000, 9999)}"
         locker.approved_at = datetime.now(timezone.utc)
         
         # Iniciar tarea para comenzar a descontar el tiempo si en 5 mins no cierra la puerta
@@ -468,6 +484,19 @@ def approve_rental(locker_id: int, background_tasks: BackgroundTasks, db: Sessio
         
     db.commit()
     db.refresh(locker)
+    
+    # Enviar correo si es un alquiler nuevo
+    if locker.pin_close and locker.status == "OCUPADO" and not locker.pending_rent_hours:
+        # Determine email to send to
+        target_email = locker.contact_email
+        if not target_email and locker.assigned_user_id:
+            user = db.query(User).filter(User.id == locker.assigned_user_id).first()
+            if user:
+                target_email = user.email
+                
+        if target_email:
+            background_tasks.add_task(send_pin_email, target_email, locker.locker_number, locker.pin_close, locker.pin_open)
+
     return locker
 
 @router.post("/{locker_id}/reject", response_model=LockerResponse)
@@ -479,8 +508,8 @@ def reject_rental(locker_id: int, db: Session = Depends(get_db), admin: User = D
     if locker.status != "ESPERANDO_VERIFICACION":
         raise HTTPException(status_code=400, detail="El casillero no está esperando verificación")
         
-    # Si pin_code ya está asignado, es una extensión rechazada
-    if locker.pin_code is not None:
+    # Si pin_close ya está asignado, es una extensión rechazada
+    if locker.pin_close is not None:
         # Volvemos a ponerlo en OCUPADO sin alterar su alquiler actual
         locker.status = "OCUPADO"
         locker.pending_rent_hours = None
@@ -495,5 +524,75 @@ def reject_rental(locker_id: int, db: Session = Depends(get_db), admin: User = D
     db.commit()
     db.refresh(locker)
     return locker
+
+class KeypadRequest(BaseModel):
+    pin: str
+
+@router.post("/{locker_number}/keypad")
+def process_keypad_pin(locker_number: str, req: KeypadRequest, db: Session = Depends(get_db)):
+    """
+    Recibe un PIN desde el teclado del ESP32.
+    - Si el PIN coincide con pin_close y el casillero está abierto, lo cierra.
+    - Si el PIN coincide con pin_open y el casillero está cerrado, lo abre.
+    """
+    locker = db.query(Locker).filter(Locker.locker_number == locker_number).first()
+    if not locker:
+        raise HTTPException(status_code=404, detail="Casillero no encontrado")
+        
+    if locker.status != "OCUPADO":
+        raise HTTPException(status_code=400, detail="Casillero no está en uso")
+        
+    # Verificar PIN de cierre
+    if req.pin == locker.pin_close:
+        if locker.is_locked:
+            return {"action": "none", "message": "Ya está cerrado", "status": "ok"}
+            
+        # Bloquear si el tiempo ya expiró
+        if locker.occupied_until and locker.occupied_until < datetime.now(timezone.utc):
+            return {"action": "none", "message": "Tiempo expirado", "status": "error"}
+        
+        locker.is_locked = True
+        
+        # Si el casillero se cierra por primera vez y el temporizador aún no empezó, iniciarlo
+        if locker.occupied_until is None and locker.pending_rent_hours:
+            locker.occupied_until = datetime.now(timezone.utc) + timedelta(hours=locker.pending_rent_hours)
+            locker.pending_rent_hours = None
+
+        db.commit()
+        return {"action": "close", "status": "ok"}
+        
+    # Verificar PIN de apertura
+    if req.pin == locker.pin_open:
+        if not locker.is_locked:
+            return {"action": "none", "message": "Ya está abierto", "status": "ok"}
+            
+        locker.is_locked = False
+        db.commit()
+        return {"action": "open", "status": "ok"}
+        
+    raise HTTPException(status_code=400, detail="PIN incorrecto")
+
+
+@router.post("/{locker_number}/alert")
+def trigger_security_alert(locker_number: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """
+    Endpoint llamado por el ESP32 cuando el sensor ultrasónico detecta movimiento
+    mientras el casillero debería estar cerrado.
+    """
+    locker = db.query(Locker).filter(Locker.locker_number == locker_number).first()
+    if not locker:
+        raise HTTPException(status_code=404, detail="Casillero no encontrado")
+        
+    if locker.status == "OCUPADO":
+        target_email = locker.contact_email
+        if not target_email and locker.assigned_user_id:
+            user = db.query(User).filter(User.id == locker.assigned_user_id).first()
+            if user:
+                target_email = user.email
+                
+        if target_email:
+            background_tasks.add_task(send_alert_email, target_email, locker.locker_number)
+            
+    return {"status": "ok", "message": "Alert triggered"}
 
 

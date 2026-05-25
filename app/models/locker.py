@@ -13,11 +13,14 @@ class Locker(Base):
     assigned_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     occupied_until = Column(DateTime(timezone=True), nullable=True)
     last_payment_at = Column(DateTime(timezone=True), nullable=True)
-    pin_code = Column(String, nullable=True)
+    pin_close = Column(String, nullable=True)
+    pin_open = Column(String, nullable=True)
     is_locked = Column(Boolean, default=False, nullable=False)
     payment_receipt_url = Column(String, nullable=True)
     pending_rent_hours = Column(Float, nullable=True)
     approved_at = Column(DateTime(timezone=True), nullable=True)
+    contact_email = Column(String, nullable=True)
+    warning_sent = Column(Boolean, default=False, nullable=False)
 
     # Relaciones
     assigned_user = relationship("User", back_populates="lockers")

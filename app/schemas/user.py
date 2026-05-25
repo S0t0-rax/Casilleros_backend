@@ -22,8 +22,7 @@ class UserResponse(UserBase):
     is_active: bool
     created_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 # Esquemas de Tokens de Autenticación
 class Token(BaseModel):

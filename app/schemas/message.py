@@ -20,8 +20,7 @@ class MessageResponse(MessageBase):
     verified_by_id: Optional[int] = None
     user_email: Optional[str] = None  # Útil para el administrador para ver quién envió el mensaje
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 class MessageVerify(BaseModel):
     response: Optional[str] = None

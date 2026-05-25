@@ -10,6 +10,41 @@ from app.api.messages import router as messages_router
 from app.models.user import User
 from app.models.locker import Locker
 from app.core.security import get_password_hash
+from app.core.email import send_warning_email
+import asyncio
+from datetime import datetime, timezone, timedelta
+
+async def check_locker_warnings():
+    while True:
+        try:
+            db = SessionLocal()
+            lockers = db.query(Locker).filter(
+                Locker.status == "OCUPADO",
+                Locker.occupied_until.isnot(None),
+                Locker.warning_sent == False
+            ).all()
+            
+            now = datetime.now(timezone.utc)
+            for locker in lockers:
+                time_left = locker.occupied_until - now
+                # Si le quedan 5 minutos o menos (pero no ha expirado aún)
+                if timedelta(minutes=0) < time_left <= timedelta(minutes=5):
+                    target_email = locker.contact_email
+                    if not target_email and locker.assigned_user_id:
+                        user = db.query(User).filter(User.id == locker.assigned_user_id).first()
+                        if user:
+                            target_email = user.email
+                    
+                    if target_email:
+                        send_warning_email(target_email, locker.locker_number)
+                        
+                    locker.warning_sent = True
+                    db.commit()
+            db.close()
+        except Exception as e:
+            print(f"Error en loop de warnings: {e}")
+        
+        await asyncio.sleep(60) # Revisa cada minuto
 
 # Crear y montar directorio de archivos estáticos para los recibos de pago
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -54,6 +89,8 @@ app.include_router(lockers_router, prefix="/api")
 
 @app.on_event("startup")
 def startup_event():
+    asyncio.create_task(check_locker_warnings())
+    
     # Inicialización de datos semilla (Seed) para pruebas rápidas
     db = SessionLocal()
     try:
