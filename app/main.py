@@ -65,11 +65,8 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # Habilitar CORS para permitir llamadas HTTP desde Angular (localhost:4200)
 # También se añade "*" en caso de pruebas con IP local en móviles
-origins = [
-    "http://localhost:4200",
-    "http://127.0.0.1:4200",
-    "http://localhost",
-]
+# Permitir cualquier origen en producción (Vercel)
+origins = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
